@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { type MapDoc, type MapObject, uid } from "@/lib/map/types";
+import { type MapDoc, type MapObject, type FloorOverlay, uid } from "@/lib/map/types";
 import { buildGraph, findRoute } from "@/lib/map/pathfind";
+import { calculateInitialOverlayBounds, fitOverlayToBounds, calibrateOverlayScale } from "@/lib/map/overlay";
 
 describe("Editor Features", () => {
   it("duplicate floor creates a new floor and copies all objects with preserved connectors", () => {
@@ -336,5 +337,121 @@ describe("Editor Features", () => {
     // The route must directly cross from Lobby 1 into Lobby 4 below Room 18 (y <= 14), NOT take a 20m detour down to y = 22
     const maxY = Math.max(...points.map((p) => p[1]));
     expect(maxY).toBeLessThan(16.0); // Never drops to the bottom corridor (y = 20..24)
+  });
+
+  describe("Blueprint / Floor Plan Overlay", () => {
+    it("calculates initial bounds fitting around existing building outline", () => {
+      const floorObjs: MapObject[] = [
+        { id: "o1", floorId: "f1", type: "outline", name: "Building Outline", x: 10, y: 20, w: 40, h: 20 },
+      ];
+      // Image with 2:1 aspect ratio (e.g. 2000 x 1000)
+      const bounds = calculateInitialOverlayBounds(2000, 1000, floorObjs);
+
+      // Should center around the outline's center (30, 30)
+      const cx = bounds.x + bounds.w / 2;
+      const cy = bounds.y + bounds.h / 2;
+      expect(cx).toBeCloseTo(30, 1);
+      expect(cy).toBeCloseTo(30, 1);
+      // Width should enclose outline with margin
+      expect(bounds.w).toBeGreaterThanOrEqual(40);
+      expect(bounds.h).toBeGreaterThanOrEqual(20);
+      // Aspect ratio should match image (2.0)
+      expect(bounds.w / bounds.h).toBeCloseTo(2.0, 1);
+    });
+
+    it("calculates default initial bounds when floor has no objects", () => {
+      const bounds = calculateInitialOverlayBounds(1600, 1200, [], [25, 35]);
+      expect(bounds.w).toBe(40);
+      expect(bounds.w / bounds.h).toBeCloseTo(1600 / 1200, 1);
+      const cx = bounds.x + bounds.w / 2;
+      const cy = bounds.y + bounds.h / 2;
+      expect(cx).toBeCloseTo(25, 1);
+      expect(cy).toBeCloseTo(35, 1);
+    });
+
+    it("fits overlay to building outline bounding box", () => {
+      const overlay: FloorOverlay = {
+        url: "data:image/png;base64,sample",
+        x: 0,
+        y: 0,
+        w: 50,
+        h: 25,
+        opacity: 0.35,
+        locked: true,
+      };
+
+      const outlineBbox = { x: 15, y: 25, w: 60, h: 30 };
+      const fitted = fitOverlayToBounds(outlineBbox, overlay, false);
+
+      expect(fitted.x).toBe(15);
+      expect(fitted.y).toBe(25);
+      expect(fitted.w).toBe(60);
+      expect(fitted.h).toBe(30);
+      expect(fitted.opacity).toBe(0.35);
+      expect(fitted.locked).toBe(true);
+    });
+
+    it("calibrates overlay scale given two reference points and target real-world distance", () => {
+      const overlay: FloorOverlay = {
+        url: "data:image/png;base64,sample",
+        x: 0,
+        y: 0,
+        w: 40,
+        h: 30,
+        opacity: 0.35,
+        locked: true,
+      };
+
+      // Two points currently 10 meters apart on the canvas
+      const p1: [number, number] = [5, 10];
+      const p2: [number, number] = [15, 10]; // distance = 10m
+      // User says real distance is 20m (should scale by 2x)
+      const calibrated = calibrateOverlayScale(p1, p2, 20, overlay);
+
+      expect(calibrated.w).toBe(80);
+      expect(calibrated.h).toBe(60);
+      // Center remains identical
+      expect(calibrated.x + calibrated.w / 2).toBeCloseTo(overlay.x + overlay.w / 2, 1);
+      expect(calibrated.y + calibrated.h / 2).toBeCloseTo(overlay.y + overlay.h / 2, 1);
+    });
+
+    it("preserves floor overlay when duplicating floor", () => {
+      const fid = "f_ground";
+      const doc: MapDoc = {
+        name: "Campus",
+        floors: [
+          {
+            id: fid,
+            name: "Ground Floor",
+            level: 0,
+            overlay: {
+              url: "data:image/png;base64,blueprint",
+              x: 10,
+              y: 10,
+              w: 50,
+              h: 40,
+              opacity: 0.35,
+              locked: true,
+              visible: true,
+            },
+          },
+        ],
+        objects: [{ id: "out1", floorId: fid, type: "outline", name: "Outline", x: 10, y: 10, w: 50, h: 40 }],
+      };
+
+      const groundFloor = doc.floors[0];
+      const nextLevel = 1;
+      const newFloor = {
+        id: "f_1",
+        name: `Floor ${nextLevel}`,
+        level: nextLevel,
+        overlay: groundFloor.overlay ? { ...groundFloor.overlay } : undefined,
+      };
+
+      expect(newFloor.overlay).toBeDefined();
+      expect(newFloor.overlay?.opacity).toBe(0.35);
+      expect(newFloor.overlay?.w).toBe(50);
+      expect(newFloor.overlay?.url).toBe("data:image/png;base64,blueprint");
+    });
   });
 });

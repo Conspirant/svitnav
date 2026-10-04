@@ -21,8 +21,8 @@ export default defineConfig(({ command }) => ({
     }),
     command === "build"
       ? nitro({
-          ...(process.env.NITRO_PRESET
-            ? { preset: process.env.NITRO_PRESET }
+          ...(process.env["NITRO_PRESET"]
+            ? { preset: process.env["NITRO_PRESET"] }
             : { defaultPreset: "cloudflare-module" }),
         })
       : undefined,

@@ -270,81 +270,141 @@ function MapPage() {
         </g>
       </svg>
 
-      {/* Search panel */}
-      <div className="absolute left-4 top-4 z-10 w-[min(380px,calc(100vw-2rem))] space-y-3">
-        <div className="panel p-4 shadow-2xl">
+      {/* Search panel / Drawer (Responsive: Collapsible bottom sheet on mobile, top-left card on desktop) */}
+      <div className="absolute inset-x-0 bottom-0 z-20 flex flex-col md:inset-x-auto md:bottom-auto md:left-4 md:top-4 md:w-[min(380px,calc(100vw-2rem))] md:space-y-3 pointer-events-none">
+        <div className="panel pointer-events-auto rounded-b-none md:rounded-b-[var(--radius)] p-4 shadow-2xl border-x-0 border-b-0 md:border-x md:border-b max-h-[82vh] md:max-h-[85vh] overflow-y-auto">
+          {/* Mobile Drag/Collapse Handle */}
+          <div className="mx-auto mb-2.5 h-1.5 w-12 rounded-full bg-muted-foreground/30 md:hidden" />
+
           <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-2 font-semibold tracking-tight">
-              <span className="flex h-7 w-7 items-center justify-center rounded bg-primary text-primary-foreground"><Navigation size={14} /></span>
+            <div className="flex items-center gap-2 font-semibold tracking-tight text-sm md:text-base">
+              <span className="flex h-7 w-7 items-center justify-center rounded bg-primary text-primary-foreground shadow-sm">
+                <Navigation size={14} />
+              </span>
               SVIT NAV
             </div>
-            <Link to="/admin/editor" className="flex items-center gap-1 text-xs text-muted-foreground hover:text-primary"><PencilRuler size={12} /> Edit map</Link>
+            <div className="flex items-center gap-2">
+              <Link to="/admin/editor" className="flex items-center gap-1 text-xs text-muted-foreground hover:text-primary transition-colors py-1 px-1.5 rounded hover:bg-secondary">
+                <PencilRuler size={13} />
+                <span className="hidden sm:inline">Editor</span>
+              </Link>
+            </div>
           </div>
+
           {isLoading && <p className="text-sm text-muted-foreground">Loading campus map…</p>}
           {error && <p className="text-sm text-destructive">Could not load the map. Please refresh.</p>}
           {!isLoading && !doc && !error && (
             <p className="text-sm text-muted-foreground">No map has been published yet. <Link to="/admin/editor" className="text-primary underline">Open the editor</Link> and press Publish.</p>
           )}
+
           {doc && (
-            <div className="space-y-2">
-              <PlacePicker label="Starting point" value={from} places={places} floorName={floorName} onPick={setFrom} currentFloorId={floorId} icon={<LocateFixed size={15} className="text-primary" />} />
-              <PlacePicker label="Where to? Search rooms, labs…" value={to} places={places} floorName={floorName} onPick={setTo} currentFloorId={floorId} icon={<Search size={15} className="text-muted-foreground" />} />
-              <div className="flex items-center justify-between pt-1">
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-muted-foreground">
-                  <input type="checkbox" checked={avoidStairs} onChange={(e) => setAvoidStairs(e.target.checked)} className="accent-[var(--primary)]" />
-                  <Accessibility size={13} /> Step-free (lifts & ramps)
+            <div className="space-y-2.5">
+              <PlacePicker label="Starting point" value={from} places={places} floorName={floorName} onPick={setFrom} currentFloorId={floorId} icon={<LocateFixed size={15} className="text-primary shrink-0" />} />
+              <PlacePicker label="Where to? Search rooms, labs…" value={to} places={places} floorName={floorName} onPick={setTo} currentFloorId={floorId} icon={<Search size={15} className="text-muted-foreground shrink-0" />} />
+
+              {/* Quick Preset Filter Chips */}
+              <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs no-scrollbar">
+                {[
+                  { label: "Restrooms", filter: "restroom" },
+                  { label: "Labs", filter: "lab" },
+                  { label: "Entrances", filter: "entrance" },
+                ].map((chip) => (
+                  <button
+                    key={chip.label}
+                    onClick={() => {
+                      const found = places.find((p) => p.type === chip.filter);
+                      if (found) setTo(found);
+                    }}
+                    className="shrink-0 rounded-full border border-border bg-secondary/80 px-2.5 py-1 text-[11px] text-muted-foreground hover:border-primary/50 hover:text-foreground transition-all"
+                  >
+                    {chip.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center justify-between pt-1 text-xs">
+                <label className="flex cursor-pointer items-center gap-2 text-muted-foreground hover:text-foreground">
+                  <input type="checkbox" checked={avoidStairs} onChange={(e) => setAvoidStairs(e.target.checked)} className="accent-[var(--primary)] h-4 w-4" />
+                  <Accessibility size={14} className="text-primary" /> Step-free (lifts & ramps)
                 </label>
-                <button className="text-xs text-muted-foreground hover:text-foreground" onClick={() => { const f = from; setFrom(to); setTo(f); }}>Swap</button>
+                <button className="font-medium text-primary hover:underline px-1 py-0.5" onClick={() => { const f = from; setFrom(to); setTo(f); }}>
+                  Swap
+                </button>
               </div>
             </div>
           )}
-        </div>
 
-        {from && to && route === null && (
-          <div className="panel p-4 text-sm text-muted-foreground">No walkable route found between these places{avoidStairs ? " without stairs" : ""}.</div>
-        )}
-        {route && (
-          <div className="panel p-4 shadow-2xl">
-            <div className="flex items-baseline gap-2">
-              <span className="text-2xl font-semibold text-primary">{minutes} min</span>
-              <span className="font-mono text-xs text-muted-foreground">{Math.round(route.total)} m · {route.transitions.length} floor change{route.transitions.length === 1 ? "" : "s"}</span>
+          {from && to && route === null && (
+            <div className="mt-3 rounded border border-border bg-muted/30 p-3 text-xs text-muted-foreground">
+              No walkable route found between these places{avoidStairs ? " without stairs" : ""}.
             </div>
-            <ol className="mt-3 space-y-1">
-              {steps.map((s, i) => (
-                <li key={i}>
-                  <button onClick={() => setFloorId(s.floorId)} className="flex w-full items-start gap-3 rounded px-2 py-1.5 text-left text-sm hover:bg-accent"
-                    style={s.floorId === floorId ? { color: "var(--foreground)" } : { color: "var(--muted-foreground)" }}>
-                    <span className="mt-0.5 text-primary">
-                      {s.icon === "walk" ? <Footprints size={14} /> : s.icon === "pin" ? <MapPin size={14} /> : s.icon === "stairs" ? <Layers size={14} /> : <ArrowUpDown size={14} />}
-                    </span>
-                    {s.text}
-                  </button>
-                </li>
-              ))}
-            </ol>
-          </div>
-        )}
+          )}
+
+          {route && (
+            <div className="mt-3 border-t border-border/60 pt-3">
+              <div className="flex items-baseline justify-between">
+                <div className="flex items-baseline gap-2">
+                  <span className="text-2xl font-bold text-primary tracking-tight">{minutes} min</span>
+                  <span className="font-mono text-xs text-muted-foreground">{Math.round(route.total)} m</span>
+                </div>
+                <span className="text-xs text-muted-foreground bg-secondary px-2 py-0.5 rounded-full">
+                  {route.transitions.length} floor change{route.transitions.length === 1 ? "" : "s"}
+                </span>
+              </div>
+              <ol className="mt-3 space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                {steps.map((s, i) => (
+                  <li key={i}>
+                    <button
+                      onClick={() => setFloorId(s.floorId)}
+                      className="flex w-full items-start gap-2.5 rounded-md p-2 text-left text-xs transition-colors hover:bg-accent"
+                      style={s.floorId === floorId ? { background: "var(--accent)", color: "var(--foreground)", fontWeight: 500 } : { color: "var(--muted-foreground)" }}
+                    >
+                      <span className="mt-0.5 text-primary shrink-0">
+                        {s.icon === "walk" ? <Footprints size={14} /> : s.icon === "pin" ? <MapPin size={14} /> : s.icon === "stairs" ? <Layers size={14} /> : <ArrowUpDown size={14} />}
+                      </span>
+                      <span className="leading-snug">{s.text}</span>
+                    </button>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Floor switcher */}
+      {/* Floor switcher (Top right on desktop, horizontal floating bar on mobile top) */}
       {doc && (
-        <div className="panel absolute right-4 top-4 z-10 flex flex-col overflow-hidden">
+        <div className="panel absolute right-3 top-3 z-10 flex md:flex-col overflow-hidden shadow-xl rounded-lg border-border">
           {[...doc.floors].sort((a, b) => b.level - a.level).map((f) => (
-            <button key={f.id} onClick={() => setFloorId(f.id)} title={f.name}
-              className="relative px-3 py-2 text-left text-sm hover:bg-accent"
-              style={f.id === floorId ? { background: "var(--primary)", color: "var(--primary-foreground)" } : undefined}>
+            <button
+              key={f.id}
+              onClick={() => setFloorId(f.id)}
+              title={f.name}
+              className="relative px-3 py-2 text-center md:text-left text-xs sm:text-sm font-medium transition-colors hover:bg-accent"
+              style={f.id === floorId ? { background: "var(--primary)", color: "var(--primary-foreground)" } : undefined}
+            >
               {f.name}
-              {otherFloors.has(f.id) && f.id !== floorId && <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-primary" />}
+              {otherFloors.has(f.id) && f.id !== floorId && (
+                <span className="absolute right-1.5 top-1.5 h-1.5 w-1.5 rounded-full bg-primary ring-2 ring-background" />
+              )}
             </button>
           ))}
         </div>
       )}
-      <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-1">
-        <button className="btn" onClick={() => zoomBy(1.3)} aria-label="Zoom in"><ZoomIn size={14} /></button>
-        <button className="btn" onClick={() => zoomBy(1 / 1.3)} aria-label="Zoom out"><ZoomOut size={14} /></button>
-        <button className="btn" onClick={() => fit(floorObjs)} aria-label="Fit map"><Maximize size={14} /></button>
+
+      {/* Floating map controls (Fit, Zoom In, Zoom Out) */}
+      <div className="absolute right-3 bottom-24 md:bottom-4 z-10 flex flex-col gap-1.5">
+        <button className="btn h-9 w-9 p-0 justify-center shadow-lg" onClick={() => zoomBy(1.3)} aria-label="Zoom in"><ZoomIn size={16} /></button>
+        <button className="btn h-9 w-9 p-0 justify-center shadow-lg" onClick={() => zoomBy(1 / 1.3)} aria-label="Zoom out"><ZoomOut size={16} /></button>
+        <button className="btn h-9 w-9 p-0 justify-center shadow-lg" onClick={() => fit(floorObjs)} aria-label="Fit map"><Maximize size={16} /></button>
       </div>
-      {doc && <div className="label absolute bottom-4 left-4 z-10">{floorName(floorId)} · tap a room to set it as destination</div>}
+
+      {/* Floor info badge */}
+      {doc && (
+        <div className="pointer-events-none hidden md:block label absolute bottom-4 left-4 z-10 bg-card/80 px-2.5 py-1 rounded backdrop-blur border border-border">
+          {floorName(floorId)} · tap a room to set destination
+        </div>
+      )}
     </div>
   );
 }

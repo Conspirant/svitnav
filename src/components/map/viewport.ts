@@ -9,32 +9,76 @@ export function useViewport(ref: RefObject<SVGSVGElement | null>) {
   viewRef.current = view;
 
   useEffect(() => {
-    const el = ref.current; if (!el) return;
+    const el = ref.current;
+    if (!el) return;
 
-    // Prevent Chrome / browser from zooming the entire webpage on Ctrl+scroll or pinch
-    const preventBrowserZoom = (e: WheelEvent) => {
+    // Prevent browser zoom when Ctrl+wheel is triggered anywhere over the page
+    const onGlobalWheel = (e: WheelEvent) => {
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault();
       }
     };
-    window.addEventListener("wheel", preventBrowserZoom, { passive: false, capture: true });
 
-    const onWheel = (e: WheelEvent) => {
+    const preventKeyZoom = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && (e.key === "+" || e.key === "-" || e.key === "=" || e.key === "0" || e.code === "NumpadAdd" || e.code === "NumpadSubtract" || e.code === "Digit0")) {
+        e.preventDefault();
+      }
+    };
+
+    // Wheel zooming directly on the SVG/workspace
+    const onSvgWheel = (e: WheelEvent) => {
       e.preventDefault();
+      e.stopPropagation();
+
       const rect = el.getBoundingClientRect();
-      const px = e.clientX - rect.left, py = e.clientY - rect.top;
-      if (e.shiftKey && !e.ctrlKey) { const d = e.deltaY || e.deltaX; setView((v) => ({ ...v, x: v.x - d })); return; }
-      const dy = e.deltaY * (e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1);
+      const px = e.clientX - rect.left;
+      const py = e.clientY - rect.top;
+
+      if (e.shiftKey && !e.ctrlKey && !e.metaKey) {
+        const d = e.deltaY || e.deltaX;
+        setView((v) => ({ ...v, x: v.x - d }));
+        return;
+      }
+
+      // Delta calculation supporting trackpads and mouse wheels
+      let dy = e.deltaY;
+      if (e.deltaMode === 1) dy *= 24;
+      else if (e.deltaMode === 2) dy *= 100;
+
+      // Handle pinch/ctrl-zoom vs standard wheel
+      const isCtrl = e.ctrlKey || e.metaKey;
+      const factor = isCtrl
+        ? Math.pow(0.992, dy)
+        : Math.exp(-dy * 0.0018);
+
       setView((v) => {
-        const k = Math.min(200, Math.max(0.5, v.k * Math.exp(-dy * 0.0018)));
+        const k = Math.min(200, Math.max(0.5, v.k * factor));
         const f = k / v.k;
         return { k, x: px - (px - v.x) * f, y: py - (py - v.y) * f };
       });
     };
-    el.addEventListener("wheel", onWheel, { passive: false });
+
+    window.addEventListener("wheel", onGlobalWheel, { passive: false, capture: true });
+    document.addEventListener("wheel", onGlobalWheel, { passive: false, capture: true });
+    window.addEventListener("keydown", preventKeyZoom, { capture: true });
+    document.addEventListener("keydown", preventKeyZoom, { capture: true });
+    el.addEventListener("wheel", onSvgWheel, { passive: false });
+
+    // Also attach to parent <main> container in case pointer is over empty padding
+    const parent = el.parentElement;
+    if (parent) {
+      parent.addEventListener("wheel", onSvgWheel, { passive: false });
+    }
+
     return () => {
-      window.removeEventListener("wheel", preventBrowserZoom, { capture: true });
-      el.removeEventListener("wheel", onWheel);
+      window.removeEventListener("wheel", onGlobalWheel, { capture: true });
+      document.removeEventListener("wheel", onGlobalWheel, { capture: true });
+      window.removeEventListener("keydown", preventKeyZoom, { capture: true });
+      document.removeEventListener("keydown", preventKeyZoom, { capture: true });
+      el.removeEventListener("wheel", onSvgWheel);
+      if (parent) {
+        parent.removeEventListener("wheel", onSvgWheel);
+      }
     };
   }, [ref]);
 

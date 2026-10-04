@@ -156,3 +156,6 @@
 
 @keyframes route-dash { to { stroke-dashoffset: -20; } }
 .route-dash { animation: route-dash 0.8s linear infinite; }
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }

@@ -36,10 +36,24 @@ export interface MapObject {
   points?: [number, number][];
 }
 
+export interface FloorOverlay {
+  url: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  /** Opacity from 0.0 to 1.0 (default 0.35) */
+  opacity: number;
+  rotation?: number;
+  locked?: boolean;
+  visible?: boolean;
+}
+
 export interface Floor {
   id: string;
   name: string;
   level: number;
+  overlay?: FloorOverlay;
 }
 
 export interface MapDoc {

@@ -3,14 +3,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   MousePointer2, Square, Rows3, Footprints, ArrowUpDown, Minus, Pentagon, DoorOpen, MapPin,
   LayoutGrid, Bath, ChevronsUp, TrendingUp, LogIn, Ban, Type, Info, RotateCw, RotateCcw, Expand, Shrink,
-  Save, Upload, Download, Rocket, Undo2, Redo2, Copy, Trash2, Plus, Maximize, ZoomIn, ZoomOut, Eye, Layers,
+  Save, Upload, Download, Rocket, Undo2, Redo2, Copy, Trash2, Plus, Maximize, ZoomIn, ZoomOut, Eye, EyeOff, Layers,
   Lock, Unlock, Magnet, Grid3X3, CheckCircle2, Clock, Loader2, AlertTriangle, FlaskConical, Palette,
+  Image as ImageIcon, SlidersHorizontal, Ruler, Crosshair,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Toaster } from "@/components/ui/sonner";
 import { GridPattern, ObjectShape, sortForRender } from "@/components/map/shapes";
 import { useViewport } from "@/components/map/viewport";
-import { bboxOf, CONNECTORS, emptyDoc, TYPE_LABEL, uid, type Floor, type MapDoc, type MapObject, type ObjType } from "@/lib/map/types";
+import { bboxOf, CONNECTORS, emptyDoc, TYPE_LABEL, uid, type Floor, type FloorOverlay, type MapDoc, type MapObject, type ObjType } from "@/lib/map/types";
+import { processOverlayImage, calculateInitialOverlayBounds, fitOverlayToBounds, calibrateOverlayScale } from "@/lib/map/overlay";
 import { sampleDoc } from "@/lib/map/sample";
 import { loadDraft, publishDoc, saveDraft } from "@/lib/map/store";
 import { importCSV, importGeoJSON } from "@/lib/map/importers";
@@ -71,11 +73,14 @@ const COLOR_PRESETS = [
 type Drag =
   | { mode: "pan"; sx: number; sy: number; vx: number; vy: number }
   | { mode: "move"; wx: number; wy: number; origs: MapObject[] }
-  | { mode: "resize"; anchor: [number, number]; orig: MapObject; handle?: string }
+  | { mode: "resize"; anchor: [number, number]; orig: MapObject; handle?: string; children?: MapObject[] }
   | { mode: "rotate"; c: [number, number]; a0: number; orig: MapObject }
-  | { mode: "vertex"; i: number; orig: MapObject }
+  | { mode: "vertex"; i: number; orig: MapObject; children?: MapObject[] }
   | { mode: "draw"; start: [number, number]; cur: [number, number] }
-  | { mode: "box-select"; start: [number, number]; cur: [number, number]; shift: boolean; initialSel: string[] };
+  | { mode: "box-select"; start: [number, number]; cur: [number, number]; shift: boolean; initialSel: string[] }
+  | { mode: "overlay-move"; wx: number; wy: number; orig: FloorOverlay }
+  | { mode: "overlay-resize"; anchor: [number, number]; orig: FloorOverlay; handle: string; keepAspect: boolean }
+  | { mode: "overlay-rotate"; c: [number, number]; a0: number; origRot: number };
 
 function transformObj(o: MapObject, nx: number, ny: number, nw: number, nh: number): MapObject {
   const points = o.points?.map(([px, py]) => [
@@ -174,6 +179,13 @@ function Editor() {
   const space = useRef(false);
   const clipboard = useRef<MapObject[]>([]);
   const { view, setView, toWorld, fit, zoomBy } = useViewport(svgRef);
+
+  // Overlay state
+  const [overlayAdjustMode, setOverlayAdjustMode] = useState(false);
+  const [overlayAspectLock, setOverlayAspectLock] = useState(true);
+  const [calibrating, setCalibrating] = useState<{ step: "p1" | "p2"; p1?: [number, number] } | null>(null);
+  const [mobileInspectorOpen, setMobileInspectorOpen] = useState(false);
+  const overlayFileRef = useRef<HTMLInputElement>(null);
 
   const snapVal = useCallback((v: number) => {
     return snapping ? Math.round(v * 2) / 2 : +v.toFixed(2);
@@ -298,6 +310,72 @@ function Editor() {
   const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]);
   const selectedObjs = useMemo(() => doc?.objects.filter((o) => selectedIdSet.has(o.id)) ?? [], [doc, selectedIdSet]);
   const selected = selectedObjs.length === 1 ? selectedObjs[0] : null;
+
+  const floor = doc?.floors.find((f) => f.id === floorId);
+  const overlay = floor?.overlay;
+
+  const updateOverlay = useCallback((patch: Partial<FloorOverlay>, record = true) => {
+    commit((d) => ({
+      ...d,
+      floors: d.floors.map((f) => {
+        if (f.id !== floorId) return f;
+        if (!f.overlay && !patch.url) return f;
+        return {
+          ...f,
+          overlay: f.overlay ? { ...f.overlay, ...patch } : (patch as FloorOverlay),
+        };
+      }),
+    }), record);
+  }, [commit, floorId]);
+
+  const onUploadOverlay = async (file: File) => {
+    if (!doc || !floor) return;
+    try {
+      toast.loading("Processing blueprint image...", { id: "overlay-upload" });
+      const { url, naturalWidth, naturalHeight } = await processOverlayImage(file);
+      const [cx, cy] = toWorld(window.innerWidth / 2, window.innerHeight / 2);
+      const bounds = calculateInitialOverlayBounds(naturalWidth, naturalHeight, floorObjs, [cx, cy]);
+      const newOverlay: FloorOverlay = {
+        url,
+        ...bounds,
+        opacity: 0.35,
+        rotation: 0,
+        locked: true,
+        visible: true,
+      };
+      updateOverlay(newOverlay);
+      toast.success("Blueprint overlaid at 35% opacity! You can now adjust outlines directly over it.", { id: "overlay-upload" });
+    } catch (err: any) {
+      toast.error("Failed to load overlay image: " + err.message, { id: "overlay-upload" });
+    }
+  };
+
+  const fitOverlayToOutline = useCallback(() => {
+    if (!floor?.overlay || !doc) return;
+    const outlines = floorObjs.filter((o) => o.type === "outline");
+    const targets = outlines.length > 0 ? outlines : floorObjs;
+    if (!targets.length) {
+      toast.error("No building outline or shapes found on this floor to fit to");
+      return;
+    }
+    const minX = Math.min(...targets.map((o) => o.x));
+    const minY = Math.min(...targets.map((o) => o.y));
+    const maxX = Math.max(...targets.map((o) => o.x + o.w));
+    const maxY = Math.max(...targets.map((o) => o.y + o.h));
+    const fitted = fitOverlayToBounds({ x: minX, y: minY, w: maxX - minX, h: maxY - minY }, floor.overlay, false);
+    updateOverlay(fitted);
+    toast.success("Fitted blueprint overlay to building outline");
+  }, [floor, doc, floorObjs, updateOverlay]);
+
+  const removeOverlay = useCallback(() => {
+    if (!confirm("Remove the blueprint overlay image from this floor?")) return;
+    commit((d) => ({
+      ...d,
+      floors: d.floors.map((f) => (f.id === floorId ? { ...f, overlay: undefined } : f)),
+    }));
+    setOverlayAdjustMode(false);
+    toast.success("Overlay image removed");
+  }, [commit, floorId]);
 
   const save = async () => {
     if (!doc) return; setBusy(true); setAutoSaveStatus("saving");
@@ -524,6 +602,66 @@ function Editor() {
       return;
     }
     const target = e.target as Element;
+
+    // Handle calibration step clicks
+    if (calibrating) {
+      if (calibrating.step === "p1") {
+        setCalibrating({ step: "p2", p1: [snapVal(wx), snapVal(wy)] });
+        toast.info("First reference point set! Now click the second reference point.");
+        return;
+      }
+      if (calibrating.step === "p2" && calibrating.p1) {
+        const p1 = calibrating.p1;
+        const p2: [number, number] = [snapVal(wx), snapVal(wy)];
+        const dist = Math.hypot(p2[0] - p1[0], p2[1] - p1[1]);
+        setCalibrating(null);
+        const input = window.prompt(`Distance between points on canvas is ${dist.toFixed(2)}m.\nEnter real-world distance in meters:`, dist.toFixed(1));
+        if (input) {
+          const val = parseFloat(input);
+          if (val > 0 && floor?.overlay) {
+            updateOverlay(calibrateOverlayScale(p1, p2, val, floor.overlay));
+            toast.success(`Overlay calibrated to ${val}m!`);
+          }
+        }
+        return;
+      }
+    }
+
+    // Handle overlay image drag / resize / rotate when in adjust mode and unlocked
+    if (overlayAdjustMode && floor?.overlay && !floor.overlay.locked) {
+      const oHandle = target.closest("[data-overlay-handle]")?.getAttribute("data-overlay-handle");
+      if (oHandle === "rot") {
+        const c: [number, number] = [floor.overlay.x + floor.overlay.w / 2, floor.overlay.y + floor.overlay.h / 2];
+        snapshot();
+        setDrag({ mode: "overlay-rotate", c, a0: Math.atan2(wy - c[1], wx - c[0]), origRot: floor.overlay.rotation ?? 0 });
+        return;
+      }
+      if (oHandle) {
+        let ax = floor.overlay.x;
+        let ay = floor.overlay.y;
+        if (oHandle.includes("w")) ax = floor.overlay.x + floor.overlay.w;
+        else if (oHandle.includes("e")) ax = floor.overlay.x;
+
+        if (oHandle.includes("n")) ay = floor.overlay.y + floor.overlay.h;
+        else if (oHandle.includes("s")) ay = floor.overlay.y;
+
+        snapshot();
+        setDrag({
+          mode: "overlay-resize",
+          anchor: [ax, ay],
+          orig: { ...floor.overlay },
+          handle: oHandle,
+          keepAspect: overlayAspectLock,
+        });
+        return;
+      }
+
+      if (target.closest("[data-overlay-image]")) {
+        snapshot();
+        setDrag({ mode: "overlay-move", wx, wy, orig: { ...floor.overlay } });
+        return;
+      }
+    }
     if (tool === "select") {
       const handle = target.closest("[data-handle]")?.getAttribute("data-handle");
       if (handle === "rot" && selected) {
@@ -541,7 +679,11 @@ function Editor() {
         if (handle[0] === "m") { const a = pts[i], b = pts[(i + 1) % pts.length]; pts.splice(i + 1, 0, [r2((a[0] + b[0]) / 2), r2((a[1] + b[1]) / 2)]); vi = i + 1; }
         const orig = { ...selected, points: pts, ...bboxOf(pts) };
         commit((d) => ({ ...d, objects: d.objects.map((x) => (x.id === selected.id ? orig : x)) }), false);
-        setDrag({ mode: "vertex", i: vi, orig }); return;
+        // Capture children for proportional scaling when vertex-dragging an outline
+        const vertChildren = selected.type === "outline"
+          ? doc.objects.filter((o) => o.floorId === floorId && o.type !== "outline" && o.id !== selected.id).map((o) => ({ ...o }))
+          : undefined;
+        setDrag({ mode: "vertex", i: vi, orig, children: vertChildren }); return;
       }
       if (handle && selected) {
         let ax = selected.x;
@@ -554,7 +696,11 @@ function Editor() {
         else if (handle.includes("s")) ay = selected.y;
         else ay = selected.y;
 
-        snapshot(); setDrag({ mode: "resize", anchor: [ax, ay], orig: selected, handle }); return;
+        // When resizing an outline, capture all non-outline floor objects as children for proportional scaling
+        const resizeChildren = selected.type === "outline"
+          ? doc.objects.filter((o) => o.floorId === floorId && o.type !== "outline" && o.id !== selected.id).map((o) => ({ ...o }))
+          : undefined;
+        snapshot(); setDrag({ mode: "resize", anchor: [ax, ay], orig: selected, handle, children: resizeChildren }); return;
       }
 
       const id = target.closest("[data-id]")?.getAttribute("data-id");
@@ -649,16 +795,74 @@ function Editor() {
         nx = drag.orig.x;
         nw = drag.orig.w;
       }
-      commit((d) => ({ ...d, objects: d.objects.map((x) => (x.id === drag.orig.id ? transformObj(drag.orig, nx, ny, nw, nh) : x)) }), false);
+      commit((d) => {
+        let objs = d.objects.map((x) => (x.id === drag.orig.id ? transformObj(drag.orig, nx, ny, nw, nh) : x));
+        // Proportionally scale children when resizing an outline
+        if (drag.children?.length && drag.orig.w > 0 && drag.orig.h > 0) {
+          const ox = drag.orig.x, oy = drag.orig.y, ow = drag.orig.w, oh = drag.orig.h;
+          objs = objs.map((x) => {
+            const child = drag.children!.find((c) => c.id === x.id);
+            if (!child) return x;
+            const cnx = r2(nx + ((child.x - ox) / ow) * nw);
+            const cny = r2(ny + ((child.y - oy) / oh) * nh);
+            const cnw = r2((child.w / ow) * nw);
+            const cnh = r2((child.h / oh) * nh);
+            return transformObj(child, cnx, cny, cnw, cnh);
+          });
+        }
+        return { ...d, objects: objs };
+      }, false);
     } else if (drag.mode === "vertex") {
       const pts = drag.orig.points!.map((p, j) => (j === drag.i ? [snapVal(wx), snapVal(wy)] : p) as [number, number]);
-      commit((d) => ({ ...d, objects: d.objects.map((x) => (x.id === drag.orig.id ? { ...x, points: pts, ...bboxOf(pts) } : x)) }), false);
+      const newBbox = bboxOf(pts);
+      commit((d) => {
+        let objs = d.objects.map((x) => (x.id === drag.orig.id ? { ...x, points: pts, ...newBbox } : x));
+        // Proportionally scale children when vertex-dragging an outline
+        if (drag.children?.length && drag.orig.w > 0 && drag.orig.h > 0) {
+          const ox = drag.orig.x, oy = drag.orig.y, ow = drag.orig.w, oh = drag.orig.h;
+          const { x: nx, y: ny, w: nw, h: nh } = newBbox;
+          objs = objs.map((x) => {
+            const child = drag.children!.find((c) => c.id === x.id);
+            if (!child) return x;
+            const cnx = r2(nx + ((child.x - ox) / ow) * nw);
+            const cny = r2(ny + ((child.y - oy) / oh) * nh);
+            const cnw = r2((child.w / ow) * nw);
+            const cnh = r2((child.h / oh) * nh);
+            return transformObj(child, cnx, cny, cnw, cnh);
+          });
+        }
+        return { ...d, objects: objs };
+      }, false);
     } else if (drag.mode === "rotate") {
       let deg = ((Math.atan2(wy - drag.c[1], wx - drag.c[0]) - drag.a0) * 180) / Math.PI;
       deg = e.shiftKey ? Math.round(deg / 15) * 15 : Math.round(deg);
       commit((d) => ({ ...d, objects: d.objects.map((x) => (x.id === drag.orig.id ? rotateObj(drag.orig, deg, drag.c[0], drag.c[1]) : x)) }), false);
     } else if (drag.mode === "draw") {
       setDrag({ ...drag, cur: [snapVal(wx), snapVal(wy)] });
+    } else if (drag.mode === "overlay-move") {
+      const dx = snapVal(wx - drag.wx);
+      const dy = snapVal(wy - drag.wy);
+      updateOverlay({ x: snapVal(drag.orig.x + dx), y: snapVal(drag.orig.y + dy) }, false);
+    } else if (drag.mode === "overlay-resize") {
+      const [ax, ay] = drag.anchor;
+      const px = snapVal(wx), py = snapVal(wy);
+      let nw = Math.max(1, Math.abs(px - ax));
+      let nh = Math.max(1, Math.abs(py - ay));
+      if (drag.keepAspect && drag.orig.h > 0) {
+        const aspect = drag.orig.w / drag.orig.h;
+        if (drag.handle.includes("e") || drag.handle.includes("w")) {
+          nh = +(nw / aspect).toFixed(2);
+        } else {
+          nw = +(nh * aspect).toFixed(2);
+        }
+      }
+      const nx = drag.handle.includes("w") ? ax - nw : ax;
+      const ny = drag.handle.includes("n") ? ay - nh : ay;
+      updateOverlay({ x: snapVal(nx), y: snapVal(ny), w: snapVal(nw), h: snapVal(nh) }, false);
+    } else if (drag.mode === "overlay-rotate") {
+      let deg = ((Math.atan2(wy - drag.c[1], wx - drag.c[0]) - drag.a0) * 180) / Math.PI;
+      deg = e.shiftKey ? Math.round(deg / 15) * 15 : Math.round(deg);
+      updateOverlay({ rotation: Math.round(drag.origRot + deg) }, false);
     }
   };
 
@@ -747,6 +951,7 @@ function Editor() {
       id: newFloorId,
       name: `Floor ${nextLevel}`,
       level: nextLevel,
+      overlay: floor.overlay ? { ...floor.overlay } : undefined,
     };
     const currentFloorObjs = doc.objects.filter((o) => o.floorId === floorId);
     const copies: MapObject[] = currentFloorObjs.map((o) => ({
@@ -773,8 +978,6 @@ function Editor() {
     setFloorId(rest[0].id);
     setSelectedIds([]);
   };
-
-  const floor = doc?.floors.find((f) => f.id === floorId);
 
   // Simple validation summary
   const issues = useMemo(() => {
@@ -869,6 +1072,47 @@ function Editor() {
           >
             <Grid3X3 size={14} />
           </button>
+
+          <div className="mx-1 h-5 w-px bg-border hidden md:block" />
+
+          {/* Blueprint Overlay Image Upload / Status Button */}
+          <input
+            ref={overlayFileRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/svg+xml"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) onUploadOverlay(f);
+              e.target.value = "";
+            }}
+          />
+          <button
+            className={`btn text-xs ${
+              floor?.overlay
+                ? "border-primary/80 bg-primary/10 text-primary font-medium"
+                : "text-muted-foreground hover:text-foreground"
+            }`}
+            onClick={() => {
+              if (!floor?.overlay) {
+                overlayFileRef.current?.click();
+              } else {
+                const next = floor.overlay.visible === false ? true : false;
+                updateOverlay({ visible: next });
+                toast.info(next ? "Blueprint overlay shown" : "Blueprint overlay hidden");
+              }
+            }}
+            title={
+              floor?.overlay
+                ? `Blueprint overlay active (${Math.round((floor.overlay.opacity ?? 0.35) * 100)}% opacity). Click to toggle show/hide.`
+                : "Overlay a floor plan blueprint image to trace and adjust outlines"
+            }
+          >
+            <ImageIcon size={13} />
+            <span className="hidden sm:inline">
+              {floor?.overlay ? `Overlay: ${Math.round((floor.overlay.opacity ?? 0.35) * 100)}%` : "Overlay image"}
+            </span>
+          </button>
         </div>
 
         <div className="ml-auto flex items-center gap-2">
@@ -904,11 +1148,18 @@ function Editor() {
             const d = emptyDoc(); commit(() => d); setFloorId(d.floors[0].id); setSelectedIds([]); setPoly([]);
             setView({ x: 40, y: 40, k: 8 }); toast.success("Map cleared — import your outline or start drawing");
           }}><Trash2 size={14} /> New map</button>
-          <button className="btn" onClick={() => fileRef.current?.click()}><Upload size={14} /> Import</button>
-          <button className="btn" onClick={exportJSON}><Download size={14} /> Export</button>
-          <button className="btn" onClick={save} disabled={busy}><Save size={14} /> Save</button>
-          <button className="btn btn-primary" onClick={publish} disabled={busy}><Rocket size={14} /> Publish</button>
+          <button className="btn hidden sm:inline-flex" onClick={() => fileRef.current?.click()}><Upload size={14} /> Import</button>
+          <button className="btn hidden sm:inline-flex" onClick={exportJSON}><Download size={14} /> Export</button>
+          <button className="btn" onClick={save} disabled={busy}><Save size={14} /> <span className="hidden sm:inline">Save</span></button>
+          <button className="btn btn-primary" onClick={publish} disabled={busy}><Rocket size={14} /> <span className="hidden sm:inline">Publish</span></button>
           <Link to="/" className="btn btn-ghost" title="Open student view"><Eye size={15} /></Link>
+          <button
+            className={`btn lg:hidden ${mobileInspectorOpen ? "border-primary bg-primary/20 text-primary font-medium" : "text-muted-foreground"}`}
+            onClick={() => setMobileInspectorOpen((o) => !o)}
+            title="Toggle Properties & Objects panel"
+          >
+            <SlidersHorizontal size={14} />
+          </button>
         </div>
       </header>
 
@@ -928,6 +1179,110 @@ function Editor() {
             <GridPattern />
             <g transform={`translate(${view.x} ${view.y}) scale(${view.k})`}>
               {showGrid && <rect x={-500} y={-500} width={2000} height={2000} fill="url(#grid-major)" />}
+
+              {/* Floor Plan / Blueprint Image Overlay */}
+              {floor?.overlay && floor.overlay.visible !== false && (
+                <g
+                  transform={
+                    floor.overlay.rotation
+                      ? `rotate(${floor.overlay.rotation} ${floor.overlay.x + floor.overlay.w / 2} ${floor.overlay.y + floor.overlay.h / 2})`
+                      : undefined
+                  }
+                >
+                  <image
+                    href={floor.overlay.url}
+                    x={floor.overlay.x}
+                    y={floor.overlay.y}
+                    width={floor.overlay.w}
+                    height={floor.overlay.h}
+                    opacity={floor.overlay.opacity ?? 0.35}
+                    preserveAspectRatio="none"
+                    style={{
+                      pointerEvents: overlayAdjustMode && !floor.overlay.locked ? "all" : "none",
+                      cursor: overlayAdjustMode && !floor.overlay.locked ? "move" : "default",
+                    }}
+                    data-overlay-image="true"
+                  />
+
+                  {/* Overlay handles when in adjust mode and unlocked */}
+                  {overlayAdjustMode && !floor.overlay.locked && (
+                    <g pointerEvents="all">
+                      <rect
+                        x={floor.overlay.x}
+                        y={floor.overlay.y}
+                        width={floor.overlay.w}
+                        height={floor.overlay.h}
+                        fill="none"
+                        stroke="var(--primary)"
+                        strokeWidth={1.5}
+                        strokeDasharray="4 3"
+                        vectorEffect="non-scaling-stroke"
+                        pointerEvents="none"
+                      />
+                      {(["nw", "ne", "sw", "se"] as const).map((hd) => (
+                        <rect
+                          key={hd}
+                          data-overlay-handle={hd}
+                          x={(hd.includes("w") ? floor.overlay!.x : floor.overlay!.x + floor.overlay!.w) - hs / 2}
+                          y={(hd.includes("n") ? floor.overlay!.y : floor.overlay!.y + floor.overlay!.h) - hs / 2}
+                          width={hs}
+                          height={hs}
+                          fill="var(--primary)"
+                          stroke="white"
+                          strokeWidth={1}
+                          vectorEffect="non-scaling-stroke"
+                          style={{ cursor: hd === "nw" || hd === "se" ? "nwse-resize" : "nesw-resize" }}
+                        />
+                      ))}
+                      {(["n", "s", "w", "e"] as const).map((hd) => (
+                        <rect
+                          key={hd}
+                          data-overlay-handle={hd}
+                          x={(hd === "w" ? floor.overlay!.x : hd === "e" ? floor.overlay!.x + floor.overlay!.w : floor.overlay!.x + floor.overlay!.w / 2) - hs / 2}
+                          y={(hd === "n" ? floor.overlay!.y : hd === "s" ? floor.overlay!.y + floor.overlay!.h : floor.overlay!.y + floor.overlay!.h / 2) - hs / 2}
+                          width={hs}
+                          height={hs}
+                          fill="var(--primary)"
+                          stroke="white"
+                          strokeWidth={1}
+                          vectorEffect="non-scaling-stroke"
+                          style={{ cursor: hd === "n" || hd === "s" ? "ns-resize" : "ew-resize" }}
+                        />
+                      ))}
+                      <line
+                        x1={floor.overlay.x + floor.overlay.w / 2}
+                        y1={floor.overlay.y}
+                        x2={floor.overlay.x + floor.overlay.w / 2}
+                        y2={floor.overlay.y - hs * 4}
+                        stroke="var(--primary)"
+                        strokeWidth={1}
+                        vectorEffect="non-scaling-stroke"
+                        pointerEvents="none"
+                      />
+                      <circle
+                        data-overlay-handle="rot"
+                        cx={floor.overlay.x + floor.overlay.w / 2}
+                        cy={floor.overlay.y - hs * 4}
+                        r={hs * 0.8}
+                        fill="var(--primary)"
+                        stroke="white"
+                        strokeWidth={1}
+                        vectorEffect="non-scaling-stroke"
+                        style={{ cursor: "grab" }}
+                      />
+                    </g>
+                  )}
+                </g>
+              )}
+
+              {/* Calibration visual guide when measuring scale */}
+              {calibrating && calibrating.p1 && (
+                <g pointerEvents="none">
+                  <circle cx={calibrating.p1[0]} cy={calibrating.p1[1]} r={6 / view.k} fill="var(--primary)" stroke="white" strokeWidth={2 / view.k} />
+                  <line x1={calibrating.p1[0]} y1={calibrating.p1[1]} x2={cursor[0]} y2={cursor[1]} stroke="var(--primary)" strokeWidth={2 / view.k} strokeDasharray="4 2" />
+                  <circle cx={cursor[0]} cy={cursor[1]} r={4 / view.k} fill="none" stroke="var(--primary)" strokeWidth={2 / view.k} />
+                </g>
+              )}
 
               {/* Render objects with lock support */}
               {floorObjs.map((o) => (
@@ -1182,6 +1537,162 @@ function Editor() {
               ))}
             </div>
           )}
+          {/* Calibration Mode Banner */}
+          {calibrating && (
+            <div className="absolute top-3 left-1/2 -translate-x-1/2 flex items-center gap-3 rounded-lg border border-primary bg-card/95 backdrop-blur px-4 py-2 text-xs shadow-2xl z-30">
+              <Crosshair size={15} className="text-primary animate-pulse" />
+              <span className="font-medium text-foreground">
+                {calibrating.step === "p1" ? "Step 1 of 2: Click first point on blueprint with known distance" : "Step 2 of 2: Click second point along the known distance"}
+              </span>
+              <button className="btn btn-ghost px-2 py-0.5 text-xs" onClick={() => setCalibrating(null)}>Cancel</button>
+            </div>
+          )}
+
+          {/* Floating Blueprint Overlay Toolbar */}
+          {floor?.overlay && !calibrating && (
+            <div
+              className={`absolute left-1/2 -translate-x-1/2 flex flex-wrap items-center gap-2 rounded-lg border border-border bg-card/95 backdrop-blur px-3 py-1.5 text-xs shadow-xl z-20 transition-all ${
+                (selected && tool === "select" && !(selected.type === "outline" && outlineLocked)) || tool === "door" || (RECT_TOOLS.includes(tool) && tool !== "label")
+                  ? "top-14"
+                  : "top-3"
+              }`}
+            >
+              <div className="flex items-center gap-1.5 font-medium text-foreground">
+                <ImageIcon size={14} className="text-primary" />
+                <span className="font-semibold text-primary">Blueprint</span>
+              </div>
+
+              {/* Show / Hide toggle */}
+              <button
+                className={`btn btn-ghost px-1.5 py-0.5 text-xs ${floor.overlay.visible === false ? "text-muted-foreground opacity-60" : "text-foreground"}`}
+                onClick={() => {
+                  const next = floor.overlay!.visible === false ? true : false;
+                  updateOverlay({ visible: next });
+                  toast.info(next ? "Blueprint overlay shown" : "Blueprint overlay hidden");
+                }}
+                title={floor.overlay.visible === false ? "Show blueprint overlay" : "Hide blueprint overlay"}
+              >
+                {floor.overlay.visible === false ? <EyeOff size={13} /> : <Eye size={13} />}
+              </button>
+
+              {/* Opacity slider */}
+              <div className="flex items-center gap-1.5 border-l border-r border-border/70 px-2">
+                <span className="text-[11px] text-muted-foreground font-medium">Opacity</span>
+                <input
+                  type="range"
+                  min="0.05"
+                  max="1"
+                  step="0.05"
+                  value={floor.overlay.opacity ?? 0.35}
+                  onChange={(e) => updateOverlay({ opacity: parseFloat(e.target.value) })}
+                  className="w-20 sm:w-28 h-1.5 accent-primary cursor-pointer"
+                  title={`Opacity: ${Math.round((floor.overlay.opacity ?? 0.35) * 100)}%`}
+                />
+                <span className="font-mono text-[11px] font-semibold text-primary w-8 text-right">
+                  {Math.round((floor.overlay.opacity ?? 0.35) * 100)}%
+                </span>
+              </div>
+
+              {/* Quick opacity preset chips */}
+              <div className="hidden sm:flex items-center gap-1">
+                {[0.2, 0.35, 0.5, 0.8].map((val) => (
+                  <button
+                    key={val}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono transition-colors ${
+                      Math.abs((floor.overlay!.opacity ?? 0.35) - val) < 0.06
+                        ? "bg-primary text-primary-foreground font-bold"
+                        : "text-muted-foreground hover:bg-secondary"
+                    }`}
+                    onClick={() => updateOverlay({ opacity: val })}
+                  >
+                    {Math.round(val * 100)}%
+                  </button>
+                ))}
+              </div>
+
+              {/* Lock / Unlock Toggle */}
+              <button
+                className={`btn px-2 py-0.5 text-xs gap-1 ${
+                  floor.overlay.locked !== false
+                    ? "border-emerald-500/50 bg-emerald-500/10 text-emerald-400 font-medium"
+                    : "border-amber-500/50 bg-amber-500/10 text-amber-300 font-medium"
+                }`}
+                onClick={() => {
+                  const next = floor.overlay!.locked === false ? true : false;
+                  updateOverlay({ locked: next });
+                  if (next) setOverlayAdjustMode(false);
+                  else setOverlayAdjustMode(true);
+                  toast.info(next ? "Overlay locked — safe to trace outlines" : "Overlay unlocked — drag or resize handles");
+                }}
+                title={
+                  floor.overlay.locked !== false
+                    ? "Overlay is locked: clicks pass through so you can select and adjust outlines directly"
+                    : "Overlay is unlocked: drag handles to move or resize the blueprint"
+                }
+              >
+                {floor.overlay.locked !== false ? <Lock size={12} /> : <Unlock size={12} />}
+                <span className="hidden md:inline">{floor.overlay.locked !== false ? "Locked (Safe to Trace)" : "Unlocked"}</span>
+              </button>
+
+              {/* Adjust Mode Toggle */}
+              <button
+                className={`btn px-2 py-0.5 text-xs gap-1 ${overlayAdjustMode ? "border-primary bg-primary/20 text-primary font-medium" : "text-muted-foreground"}`}
+                onClick={() => {
+                  if (overlayAdjustMode) {
+                    setOverlayAdjustMode(false);
+                    updateOverlay({ locked: true });
+                    toast.info("Overlay locked — trace outlines freely");
+                  } else {
+                    setOverlayAdjustMode(true);
+                    updateOverlay({ locked: false });
+                    toast.info("Adjust mode: drag image to reposition, drag corner dots to resize");
+                  }
+                }}
+                title={overlayAdjustMode ? "Finish adjusting and lock" : "Reposition or resize overlay image"}
+              >
+                <SlidersHorizontal size={12} />
+                <span className="hidden md:inline">{overlayAdjustMode ? "Done Adjusting" : "Adjust Image"}</span>
+              </button>
+
+              {/* Fit to Outline */}
+              <button
+                className="btn btn-ghost px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hidden lg:inline-flex"
+                onClick={fitOverlayToOutline}
+                title="Fit blueprint image to current building outline"
+              >
+                Fit to outline
+              </button>
+
+              {/* Calibrate Scale */}
+              <button
+                className="btn btn-ghost px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground hidden lg:inline-flex"
+                onClick={() => {
+                  setCalibrating({ step: "p1" });
+                  toast.info("Click the first point of a known length on the blueprint.");
+                }}
+                title="Calibrate blueprint scale by clicking two points and entering real distance"
+              >
+                <Ruler size={12} /> Calibrate
+              </button>
+
+              {/* Replace & Delete */}
+              <button
+                className="btn btn-ghost px-1.5 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => overlayFileRef.current?.click()}
+                title="Replace blueprint image"
+              >
+                Replace
+              </button>
+              <button
+                className="btn btn-ghost px-1.5 py-0.5 text-xs text-destructive hover:bg-destructive/10"
+                onClick={removeOverlay}
+                title="Remove overlay from this floor"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
+          )}
+
           {!showHelp && <button className="btn absolute left-3 top-3" onClick={() => setShowHelp(true)} title="Show tool tips"><Info size={14} /> Tips</button>}
           <div className="absolute bottom-3 right-3 flex flex-col gap-1">
             <button className="btn" onClick={() => zoomBy(1.3)}><ZoomIn size={14} /></button>
@@ -1190,7 +1701,25 @@ function Editor() {
           </div>
         </main>
 
-        <aside className="flex w-72 flex-col border-l border-border">
+        {/* Right Inspector Panel: static on lg screens, overlay drawer on mobile/tablet */}
+        <aside
+          className={`fixed inset-y-0 right-0 z-40 w-80 max-w-[85vw] bg-card flex flex-col border-l border-border shadow-2xl transition-transform duration-200 lg:static lg:w-72 lg:translate-x-0 ${
+            mobileInspectorOpen ? "translate-x-0" : "translate-x-full lg:translate-x-0"
+          }`}
+        >
+          {/* Mobile close button */}
+          <div className="flex items-center justify-between border-b border-border p-2.5 lg:hidden">
+            <span className="font-semibold text-xs text-primary flex items-center gap-1.5">
+              <SlidersHorizontal size={13} /> Properties & Objects
+            </span>
+            <button
+              onClick={() => setMobileInspectorOpen(false)}
+              className="btn btn-ghost px-2 py-0.5 text-xs text-muted-foreground hover:text-foreground"
+            >
+              Close ✕
+            </button>
+          </div>
+
           {/* Floor Panel with Duplicate Floor Button */}
           <div className="space-y-3 border-b border-border p-4">
             <div className="flex items-center justify-between">
@@ -1217,6 +1746,182 @@ function Editor() {
                   <TransformControls onRotate={(deg) => allTransform((o, cx, cy) => rotateObj(o, deg, cx, cy))} onScale={(f) => allTransform((o, cx, cy) => scaleObj(o, f, cx, cy))} /></div>}
               </div>
             </details>
+
+            {/* Blueprint Image Overlay Card */}
+            <div className="rounded border border-border/80 bg-secondary/20 p-2.5 space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-semibold text-primary flex items-center gap-1.5">
+                  <ImageIcon size={13} /> Blueprint Overlay
+                </span>
+                {floor?.overlay && (
+                  <div className="flex items-center gap-1">
+                    <button
+                      className={`btn btn-ghost px-1 py-0.5 text-xs ${floor.overlay?.visible === false ? "text-muted-foreground opacity-50" : "text-foreground"}`}
+                      onClick={() => updateOverlay({ visible: floor.overlay?.visible === false ? true : false })}
+                      title={floor.overlay?.visible === false ? "Show overlay" : "Hide overlay"}
+                    >
+                      {floor.overlay?.visible === false ? <EyeOff size={12} /> : <Eye size={12} />}
+                    </button>
+                    <button
+                      className={`btn btn-ghost px-1 py-0.5 text-xs ${floor.overlay?.locked !== false ? "text-emerald-400" : "text-amber-300"}`}
+                      onClick={() => {
+                        const next = floor.overlay?.locked === false ? true : false;
+                        updateOverlay({ locked: next });
+                        setOverlayAdjustMode(!next);
+                      }}
+                      title={floor.overlay?.locked !== false ? "Locked (safe to trace outlines)" : "Unlocked (editable)"}
+                    >
+                      {floor.overlay?.locked !== false ? <Lock size={12} /> : <Unlock size={12} />}
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {!floor?.overlay ? (
+                <div className="space-y-1.5 text-xs">
+                  <p className="text-[11px] text-muted-foreground leading-normal">
+                    Overlay a CAD blueprint or floor plan image to trace and adjust outlines with low opacity.
+                  </p>
+                  <button
+                    className="btn w-full justify-center text-xs gap-1.5 py-1.5"
+                    onClick={() => overlayFileRef.current?.click()}
+                  >
+                    <Upload size={13} /> Upload blueprint image
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-2 text-xs">
+                  {/* Opacity slider with live value */}
+                  <div className="space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-muted-foreground">Opacity</span>
+                      <span className="font-mono text-primary font-semibold">
+                        {Math.round((floor.overlay.opacity ?? 0.35) * 100)}%
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0.05"
+                      max="1"
+                      step="0.05"
+                      value={floor.overlay.opacity ?? 0.35}
+                      onChange={(e) => updateOverlay({ opacity: parseFloat(e.target.value) })}
+                      className="w-full h-1.5 accent-primary cursor-pointer"
+                    />
+                    <div className="grid grid-cols-4 gap-1 pt-0.5">
+                      {[0.15, 0.35, 0.55, 0.85].map((val) => (
+                        <button
+                          key={val}
+                          className={`rounded py-0.5 text-[10px] font-mono border border-border ${
+                            Math.abs((floor.overlay!.opacity ?? 0.35) - val) < 0.08
+                              ? "bg-primary text-primary-foreground font-bold"
+                              : "text-muted-foreground hover:bg-secondary"
+                          }`}
+                          onClick={() => updateOverlay({ opacity: val })}
+                        >
+                          {Math.round(val * 100)}%
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Lock / Adjust status note */}
+                  <div className="rounded bg-background/60 p-1.5 text-[11px] text-muted-foreground leading-tight">
+                    {floor.overlay.locked !== false
+                      ? "🔒 Locked: non-blocking reference — you can click, draw and adjust outlines directly on top."
+                      : "🔓 Unlocked: drag the image or corner dots on the canvas to align and scale."}
+                  </div>
+
+                  {/* Numeric dimensions */}
+                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-muted-foreground font-mono">Width (m)</span>
+                      <input
+                        type="number"
+                        step={0.5}
+                        className="field font-mono text-xs py-0.5"
+                        value={floor.overlay.w}
+                        onChange={(e) => {
+                          const val = Math.max(1, parseFloat(e.target.value) || 1);
+                          if (overlayAspectLock && floor.overlay!.w > 0) {
+                            const ratio = floor.overlay!.h / floor.overlay!.w;
+                            updateOverlay({ w: val, h: +(val * ratio).toFixed(2) });
+                          } else {
+                            updateOverlay({ w: val });
+                          }
+                        }}
+                      />
+                    </label>
+                    <label className="space-y-0.5">
+                      <span className="text-[10px] text-muted-foreground font-mono">Height (m)</span>
+                      <input
+                        type="number"
+                        step={0.5}
+                        className="field font-mono text-xs py-0.5"
+                        value={floor.overlay.h}
+                        onChange={(e) => {
+                          const val = Math.max(1, parseFloat(e.target.value) || 1);
+                          if (overlayAspectLock && floor.overlay!.h > 0) {
+                            const ratio = floor.overlay!.w / floor.overlay!.h;
+                            updateOverlay({ h: val, w: +(val * ratio).toFixed(2) });
+                          } else {
+                            updateOverlay({ h: val });
+                          }
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <div className="flex items-center justify-between text-[11px] pt-1">
+                    <label className="flex items-center gap-1.5 cursor-pointer text-muted-foreground hover:text-foreground">
+                      <input
+                        type="checkbox"
+                        checked={overlayAspectLock}
+                        onChange={(e) => setOverlayAspectLock(e.target.checked)}
+                        className="rounded accent-primary"
+                      />
+                      Lock aspect ratio
+                    </label>
+                    <button
+                      className="text-xs text-primary hover:underline"
+                      onClick={fitOverlayToOutline}
+                      title="Fit overlay bounds to building outline"
+                    >
+                      Fit to outline
+                    </button>
+                  </div>
+
+                  {/* Action buttons */}
+                  <div className="grid grid-cols-2 gap-1.5 pt-1">
+                    <button
+                      className="btn text-xs justify-center py-1 gap-1"
+                      onClick={() => {
+                        setCalibrating({ step: "p1" });
+                        toast.info("Click two points on the blueprint to calibrate real-world distance.");
+                      }}
+                      title="Calibrate scale using 2 known points"
+                    >
+                      <Ruler size={12} /> Calibrate
+                    </button>
+                    <button
+                      className="btn text-xs justify-center py-1 gap-1"
+                      onClick={() => overlayFileRef.current?.click()}
+                      title="Replace image"
+                    >
+                      <Upload size={12} /> Replace
+                    </button>
+                  </div>
+
+                  <button
+                    className="btn btn-ghost w-full justify-center text-xs text-destructive hover:bg-destructive/10 py-1"
+                    onClick={removeOverlay}
+                  >
+                    <Trash2 size={12} /> Remove overlay
+                  </button>
+                </div>
+              )}
+            </div>
+
             {doc.floors.length > 1 && <button className="text-xs text-destructive hover:underline" onClick={deleteFloor}>Delete this floor</button>}
           </div>
 
